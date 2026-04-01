@@ -243,7 +243,7 @@ class VectorStoreManager:
         except Exception:
             return []
     
-    def hybrid_search(self, store_name: str, query: str, query_embedding: List[float], top_k: int = 5, bm25_weight: float = 0.5) -> List[Dict[str, Any]]:
+    def hybrid_search(self, store_name: str, query: str, query_embedding: List[float], top_k: int = 5, method: str = 'rrf', rrf_k: int = 60, alpha: float = 0.5) -> List[Dict[str, Any]]:
         """
         混合检索：BM25 + 向量检索
         
@@ -252,80 +252,121 @@ class VectorStoreManager:
             query: 查询文本
             query_embedding: 查询嵌入
             top_k: 返回前 k 个结果
-            bm25_weight: BM25 权重
+            method: 融合方法 ('rrf' 倒数排名融合, 'weighted' 加权融合)
+            rrf_k: RRF 平滑常数，通常取 60
+            alpha: 加权融合时向量检索的权重 (0-1)
             
         Returns:
             混合检索结果列表
         """
         try:
-            # 获取两种检索结果
             vector_results = self.search(store_name, query_embedding, top_k * 2)
             bm25_results = self.bm25_search(store_name, query, top_k * 2)
             
-            # 倒数排名融合
-            fused_results = self._reciprocal_rank_fusion(vector_results, bm25_results, top_k)
-            
-            return fused_results
+            if method == 'rrf':
+                return self._reciprocal_rank_fusion(vector_results, bm25_results, top_k, rrf_k)
+            else:
+                return self._weighted_fusion(vector_results, bm25_results, top_k, alpha)
         except Exception:
             return []
     
-    def _reciprocal_rank_fusion(self, vector_results: List[Dict[str, Any]], bm25_results: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    def _reciprocal_rank_fusion(self, vector_results: List[Dict[str, Any]], bm25_results: List[Dict[str, Any]], top_k: int, k: int = 60) -> List[Dict[str, Any]]:
         """
-        倒数排名融合算法
+        标准倒数排名融合算法 (Reciprocal Rank Fusion)
+        
+        RRF 公式：RRF(d) = Σ 1 / (k + rank(d))
+        
+        优点：不依赖原始分数分布，只依赖排名，解决了不同检索系统分数不可比的问题
         
         Args:
             vector_results: 向量检索结果
             bm25_results: BM25 检索结果
             top_k: 返回前 k 个结果
+            k: 平滑常数，通常取 60
             
         Returns:
             融合后的结果
         """
-        # 计算每个文档的倒数排名得分
         scores = {}
+        doc_info = {}
         
-        # 处理向量检索结果
         for rank, result in enumerate(vector_results, 1):
             doc_id = result['id']
             if doc_id not in scores:
                 scores[doc_id] = 0
-            # 向量检索使用距离，需要转换为相似度
-            distance = result.get('score', 0)
-            similarity = 1.0 / (1.0 + distance)  # 转换为相似度
-            scores[doc_id] += similarity / rank
+                doc_info[doc_id] = result
+            scores[doc_id] += 1.0 / (k + rank)
         
-        # 处理 BM25 结果
         for rank, result in enumerate(bm25_results, 1):
             doc_id = result['id']
             if doc_id not in scores:
                 scores[doc_id] = 0
-            bm25_score = result.get('score', 0)
-            # 归一化 BM25 得分
-            normalized_score = bm25_score / (bm25_score + 1) if bm25_score > 0 else 0
-            scores[doc_id] += normalized_score / rank
+                doc_info[doc_id] = result
+            scores[doc_id] += 1.0 / (k + rank)
         
-        # 排序并获取 top_k
         sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
         
-        # 构建最终结果
         fused_results = []
         for doc_id, score in sorted_docs:
-            # 从原始结果中获取文档信息
-            doc_info = None
-            for result in vector_results:
-                if result['id'] == doc_id:
-                    doc_info = result
-                    break
-            if not doc_info:
-                for result in bm25_results:
-                    if result['id'] == doc_id:
-                        doc_info = result
-                        break
+            result = doc_info[doc_id].copy()
+            result['rrf_score'] = score
+            fused_results.append(result)
+        
+        return fused_results
+    
+    def _weighted_fusion(self, vector_results: List[Dict[str, Any]], bm25_results: List[Dict[str, Any]], top_k: int, alpha: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        加权融合算法 (先归一化分数，再加权)
+        
+        Args:
+            vector_results: 向量检索结果
+            bm25_results: BM25 检索结果
+            top_k: 返回前 k 个结果
+            alpha: 向量检索权重 (0-1)，BM25 权重为 (1-alpha)
             
-            if doc_info:
-                fused_result = doc_info.copy()
-                fused_result['score'] = score
-                fused_results.append(fused_result)
+        Returns:
+            融合后的结果
+        """
+        def normalize_scores(results):
+            if not results:
+                return results
+            scores = [r['score'] for r in results]
+            min_s, max_s = min(scores), max(scores)
+            if max_s == min_s:
+                for r in results:
+                    r['normalized_score'] = 1.0
+            else:
+                for r in results:
+                    r['normalized_score'] = (r['score'] - min_s) / (max_s - min_s)
+            return results
+        
+        vector_results = normalize_scores(vector_results.copy())
+        bm25_results = normalize_scores(bm25_results.copy())
+        
+        scores = {}
+        doc_info = {}
+        
+        for result in vector_results:
+            doc_id = result['id']
+            if doc_id not in scores:
+                scores[doc_id] = 0
+                doc_info[doc_id] = result
+            scores[doc_id] += alpha * result['normalized_score']
+        
+        for result in bm25_results:
+            doc_id = result['id']
+            if doc_id not in scores:
+                scores[doc_id] = 0
+                doc_info[doc_id] = result
+            scores[doc_id] += (1 - alpha) * result['normalized_score']
+        
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        
+        fused_results = []
+        for doc_id, score in sorted_docs:
+            result = doc_info[doc_id].copy()
+            result['fusion_score'] = score
+            fused_results.append(result)
         
         return fused_results
     
