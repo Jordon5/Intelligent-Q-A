@@ -243,7 +243,7 @@ class VectorStoreManager:
         except Exception:
             return []
     
-    def hybrid_search(self, store_name: str, query: str, query_embedding: List[float], top_k: int = 5, method: str = 'rrf', rrf_k: int = 60, alpha: float = 0.5) -> List[Dict[str, Any]]:
+    def hybrid_search(self, store_name: str, query: str, query_embedding: List[float], top_k: int = 5, bm25_weight: float = 0.5) -> List[Dict[str, Any]]:
         """
         混合检索：BM25 + 向量检索
         
@@ -252,121 +252,67 @@ class VectorStoreManager:
             query: 查询文本
             query_embedding: 查询嵌入
             top_k: 返回前 k 个结果
-            method: 融合方法 ('rrf' 倒数排名融合, 'weighted' 加权融合)
-            rrf_k: RRF 平滑常数，通常取 60
-            alpha: 加权融合时向量检索的权重 (0-1)
+            bm25_weight: BM25 权重
             
         Returns:
             混合检索结果列表
         """
         try:
+            # 获取两种检索结果
             vector_results = self.search(store_name, query_embedding, top_k * 2)
             bm25_results = self.bm25_search(store_name, query, top_k * 2)
             
-            if method == 'rrf':
-                return self._reciprocal_rank_fusion(vector_results, bm25_results, top_k, rrf_k)
-            else:
-                return self._weighted_fusion(vector_results, bm25_results, top_k, alpha)
+            # 倒数排名融合
+            fused_results = self._reciprocal_rank_fusion(vector_results, bm25_results, top_k)
+            
+            return fused_results
         except Exception:
             return []
     
     def _reciprocal_rank_fusion(self, vector_results: List[Dict[str, Any]], bm25_results: List[Dict[str, Any]], top_k: int, k: int = 60) -> List[Dict[str, Any]]:
         """
-        标准倒数排名融合算法 (Reciprocal Rank Fusion)
+        倒数排名融合算法（标准 RRF）
         
-        RRF 公式：RRF(d) = Σ 1 / (k + rank(d))
-        
-        优点：不依赖原始分数分布，只依赖排名，解决了不同检索系统分数不可比的问题
+        RRF(d) = Σ 1 / (k + rank(d))
         
         Args:
             vector_results: 向量检索结果
             bm25_results: BM25 检索结果
             top_k: 返回前 k 个结果
-            k: 平滑常数，通常取 60
+            k: 平滑常数，默认 60
             
         Returns:
             融合后的结果
         """
         scores = {}
-        doc_info = {}
+        doc_info_map = {}
         
+        # 处理向量检索结果（只用排名，不用原始分数）
         for rank, result in enumerate(vector_results, 1):
             doc_id = result['id']
             if doc_id not in scores:
                 scores[doc_id] = 0
-                doc_info[doc_id] = result
+                doc_info_map[doc_id] = result
             scores[doc_id] += 1.0 / (k + rank)
         
+        # 处理 BM25 结果（只用排名，不用原始分数）
         for rank, result in enumerate(bm25_results, 1):
             doc_id = result['id']
             if doc_id not in scores:
                 scores[doc_id] = 0
-                doc_info[doc_id] = result
+                doc_info_map[doc_id] = result
             scores[doc_id] += 1.0 / (k + rank)
         
+        # 按 RRF 分数排序并获取 top_k
         sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
         
+        # 构建最终结果
         fused_results = []
-        for doc_id, score in sorted_docs:
-            result = doc_info[doc_id].copy()
-            result['rrf_score'] = score
-            fused_results.append(result)
-        
-        return fused_results
-    
-    def _weighted_fusion(self, vector_results: List[Dict[str, Any]], bm25_results: List[Dict[str, Any]], top_k: int, alpha: float = 0.5) -> List[Dict[str, Any]]:
-        """
-        加权融合算法 (先归一化分数，再加权)
-        
-        Args:
-            vector_results: 向量检索结果
-            bm25_results: BM25 检索结果
-            top_k: 返回前 k 个结果
-            alpha: 向量检索权重 (0-1)，BM25 权重为 (1-alpha)
-            
-        Returns:
-            融合后的结果
-        """
-        def normalize_scores(results):
-            if not results:
-                return results
-            scores = [r['score'] for r in results]
-            min_s, max_s = min(scores), max(scores)
-            if max_s == min_s:
-                for r in results:
-                    r['normalized_score'] = 1.0
-            else:
-                for r in results:
-                    r['normalized_score'] = (r['score'] - min_s) / (max_s - min_s)
-            return results
-        
-        vector_results = normalize_scores(vector_results.copy())
-        bm25_results = normalize_scores(bm25_results.copy())
-        
-        scores = {}
-        doc_info = {}
-        
-        for result in vector_results:
-            doc_id = result['id']
-            if doc_id not in scores:
-                scores[doc_id] = 0
-                doc_info[doc_id] = result
-            scores[doc_id] += alpha * result['normalized_score']
-        
-        for result in bm25_results:
-            doc_id = result['id']
-            if doc_id not in scores:
-                scores[doc_id] = 0
-                doc_info[doc_id] = result
-            scores[doc_id] += (1 - alpha) * result['normalized_score']
-        
-        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        
-        fused_results = []
-        for doc_id, score in sorted_docs:
-            result = doc_info[doc_id].copy()
-            result['fusion_score'] = score
-            fused_results.append(result)
+        for doc_id, rrf_score in sorted_docs:
+            if doc_id in doc_info_map:
+                fused_result = doc_info_map[doc_id].copy()
+                fused_result['score'] = rrf_score
+                fused_results.append(fused_result)
         
         return fused_results
     
