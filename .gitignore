@@ -1,0 +1,41 @@
+# 虚拟环境
+venv/
+env/
+*.env
+rag_env/
+
+# 依赖缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 数据和知识库
+data/
+character-knowledge/
+
+# 日志文件
+*.log
+
+# 编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统文件
+Thumbs.db
+.DS_Store
+
+# 测试文件
+tests/__pycache__/
+
+# API 密钥和配置
+.env
+.env.local
+.env.*.local
+
+# 构建文件
+build/
+dist/
+*.egg-info/
